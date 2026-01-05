@@ -6,12 +6,13 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional
+from urllib.parse import quote_plus
 
 import requests
 
 DEFAULT_RAPIDAPI_BASE = "https://free-api-live-football-data.p.rapidapi.com"
 NORMALIZED_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-# IDs baseados no catálogo público da SportAPI (RapidAPI). Ajuste se necessário.
+# IDs opcionais para fallback quando a busca não encontra o team_id (apenas último recurso).
 DEFAULT_TEAM_IDS = {
     "cruzeiro": 4249,
     "atletico-mg": 4251,
@@ -67,7 +68,8 @@ def normalize_team_key(name: str) -> str:
 
 def build_team_id_map() -> Dict[str, int]:
     mapping = dict(DEFAULT_TEAM_IDS)
-    raw = os.getenv("SPORTAPI_TEAM_IDS", "").strip()
+    raw = os.getenv("FREEAPI_TEAM_IDS") or os.getenv("SPORTAPI_TEAM_IDS") or ""
+    raw = raw.strip()
     if raw:
         try:
             overrides = json.loads(raw)
@@ -108,6 +110,7 @@ class FreeFootballAPIClient:
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = safe_join(self.cfg.rapidapi_base, path)
         params = params or {}
+        log.info(f"[INFO] Free API GET {url} params={json.dumps(params, ensure_ascii=False)}")
         backoff = 2
         for attempt in range(1, self.cfg.retry_max + 1):
             try:
@@ -136,6 +139,10 @@ class FreeFootballAPIClient:
                 log.error(resp.text[:300])
                 raise SystemExit(1)
 
+            if resp.status_code == 404:
+                log.warning(f"[WARN] Free API retornou 404 em {url}.")
+                raise FileNotFoundError(f"Free API 404 em {url}")
+
             if resp.status_code == 429:
                 log.warning(f"[WARN] RapidAPI limitou (429) tentativa {attempt}/{self.cfg.retry_max}")
                 if attempt >= self.cfg.retry_max:
@@ -154,26 +161,201 @@ class FreeFootballAPIClient:
 
         raise RuntimeError(f"Free API falhou após {self.cfg.retry_max} tentativas em {path}")
 
-    def fixtures_by_team(self, team_id: int, season: int, dfrom: date, dto: date) -> List[Dict[str, Any]]:
-        from_date = to_date(dfrom)
-        to_date_value = to_date(dto)
-        params = {
-            "team": team_id,
-            "season": season,
-            "from": from_date.isoformat(),
-            "to": to_date_value.isoformat(),
-        }
-        data = self._get("/fixtures", params=params)
-        fixtures = (
-            data.get("response")
-            or data.get("fixtures")
-            or data.get("data")
-            or data.get("results")
-            or []
-        )
-        if not isinstance(fixtures, list):
+    @staticmethod
+    def _extract_list(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
             return []
-        return fixtures
+        for key in ("response", "fixtures", "data", "results", "matches", "items"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return items
+        return []
+
+    @staticmethod
+    def _normalize_team_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        if "team" in entry and isinstance(entry["team"], dict):
+            team_entry = entry["team"]
+            team_entry = dict(team_entry)
+            team_entry.setdefault("_parent", entry)
+            return team_entry
+        return entry
+
+    @staticmethod
+    def _team_name_from_entry(entry: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(entry, dict):
+            return None
+        for key in ("name", "team_name", "teamName", "shortName", "short_name", "displayName"):
+            val = entry.get(key)
+            if val:
+                return str(val)
+        return None
+
+    @staticmethod
+    def _team_id_from_entry(entry: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(entry, dict):
+            return None
+        for key in ("id", "team_id", "teamId"):
+            val = entry.get(key)
+            if isinstance(val, (int, float)) or (isinstance(val, str) and val.isdigit()):
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @staticmethod
+    def _team_country_from_entry(entry: Dict[str, Any]) -> str:
+        country_block = None
+        if "country" in entry:
+            country_block = entry.get("country")
+        elif "_parent" in entry:
+            parent = entry.get("_parent") or {}
+            country_block = parent.get("country")
+        if isinstance(country_block, dict):
+            return (country_block.get("name") or country_block.get("code") or "").lower()
+        if isinstance(country_block, str):
+            return country_block.lower()
+        return ""
+
+    def search_team_id(self, team_name: str, country: str) -> Optional[int]:
+        attempts: List[Dict[str, Any]] = [
+            {
+                "name": "teams_search_name",
+                "path": "/teams/search",
+                "params": lambda n, c: {"name": n, "country": c},
+            },
+            {
+                "name": "teams_search_team",
+                "path": "/teams/search",
+                "params": lambda n, c: {"team": n, "country": c},
+            },
+            {
+                "name": "teams_query",
+                "path": "/teams/search",
+                "params": lambda n, c: {"query": n, "country": c},
+            },
+            {
+                "name": "teams_filter",
+                "path": "/teams",
+                "params": lambda n, c: {"search": n, "country": c},
+            },
+            {
+                "name": "teams_exact",
+                "path": "/teams",
+                "params": lambda n, c: {"name": n, "country": c},
+            },
+            {
+                "name": "teams_by_name",
+                "path": lambda n, c: f"/teams/{quote_plus(n)}",
+                "params": lambda n, c: {"country": c},
+            },
+        ]
+        normalized_name = (team_name or "").strip().lower()
+        normalized_country = (country or "").strip().lower()
+
+        for attempt in attempts:
+            path_builder = attempt["path"]
+            if callable(path_builder):
+                path = path_builder(team_name, country)
+            else:
+                path = path_builder
+            params_builder = attempt.get("params")
+            params = params_builder(team_name, country) if callable(params_builder) else {}
+            try:
+                data = self._get(path, params=params)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                log.warning(f"[WARN] Falha em {path} para busca de time '{team_name}': {exc}")
+                continue
+
+            entries = self._extract_list(data)
+            for entry in entries:
+                team_entry = self._normalize_team_entry(entry)
+                team_id = self._team_id_from_entry(team_entry)
+                name = (self._team_name_from_entry(team_entry) or "").strip().lower()
+                if not team_id or not name:
+                    continue
+                country_value = self._team_country_from_entry(team_entry)
+                if normalized_country and country_value and normalized_country not in country_value:
+                    continue
+                if normalized_name == name or normalized_name in name or name in normalized_name:
+                    log.info(f"[INFO] search_team '{team_name}' resolved via {path} -> {team_id}")
+                    return team_id
+
+        log.warning(f"[WARN] search_team não encontrou '{team_name}'.")
+        return None
+
+    def fetch_fixtures(self, team_id: int, season: int, dfrom: date, dto: date) -> List[Dict[str, Any]]:
+        from_date = to_date(dfrom).isoformat()
+        to_date_value = to_date(dto).isoformat()
+        attempts: List[Dict[str, Any]] = [
+            {
+                "name": "fixtures_team_path",
+                "path": lambda tid: f"/fixtures/team/{tid}",
+                "params": lambda: {"from": from_date, "to": to_date_value, "season": season},
+                "needs_filter": False,
+            },
+            {
+                "name": "teams_fixtures",
+                "path": lambda tid: f"/teams/{tid}/fixtures",
+                "params": lambda: {"from": from_date, "to": to_date_value, "season": season},
+                "needs_filter": False,
+            },
+            {
+                "name": "fixtures_with_team_param",
+                "path": lambda tid: "/fixtures",
+                "params": lambda: {"team": tid, "from": from_date, "to": to_date_value, "season": season},
+                "needs_filter": False,
+            },
+            {
+                "name": "fixtures_fallback",
+                "path": lambda tid: "/fixtures",
+                "params": lambda: {"from": from_date, "to": to_date_value, "season": season},
+                "needs_filter": True,
+            },
+        ]
+
+        for attempt in attempts:
+            path = attempt["path"](team_id)
+            params = attempt["params"]()
+            try:
+                data = self._get(path, params=params)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                log.warning(f"[WARN] Falha em {path} ao buscar fixtures do team {team_id}: {exc}")
+                continue
+            fixtures = self._extract_list(data)
+            if attempt.get("needs_filter"):
+                fixtures = [
+                    fx for fx in fixtures
+                    if self._fixture_matches_team_id(fx, team_id)
+                ]
+            if fixtures:
+                log.info(f"[INFO] Fixtures obtidas via {path}: {len(fixtures)} registros.")
+                return fixtures
+
+        log.warning(f"[WARN] Nenhum fixture retornado para team_id {team_id}.")
+        return []
+
+    @staticmethod
+    def _fixture_matches_team_id(fixture: Dict[str, Any], team_id: int) -> bool:
+        teams = fixture.get("teams") or {}
+        for side in ("home", "away"):
+            team_data = teams.get(side)
+            if not isinstance(team_data, dict):
+                continue
+            t_id = team_data.get("id") or team_data.get("team_id")
+            if isinstance(t_id, (int, float)) and int(t_id) == team_id:
+                return True
+            if isinstance(t_id, str) and t_id.isdigit() and int(t_id) == team_id:
+                return True
+        return False
 
 
 class OdooClient:
@@ -391,16 +573,19 @@ def main() -> int:
     endpoint_success_count = 0
     for team_name in cfg.teams:
         log.info(f"[INFO] Resolvendo team_id para '{team_name}'...")
-        team_id: Optional[int] = team_id_map.get(normalize_team_key(team_name))
-        if team_id:
-            log.info(f"[INFO] TEAM_IDS '{team_name}' -> {team_id}")
+        team_id: Optional[int] = api.search_team_id(team_name, cfg.country)
+        if not team_id:
+            fallback = team_id_map.get(normalize_team_key(team_name))
+            if fallback:
+                team_id = fallback
+                log.info(f"[INFO] Fallback TEAM_IDS '{team_name}' -> {team_id}")
         if not team_id:
             log.error(f"[ERROR] Não foi possível resolver team_id para '{team_name}'. Pulando.")
             continue
 
         log.info(f"[INFO] Time '{team_name}' -> team_id {team_id}")
         try:
-            fixtures = api.fixtures_by_team(team_id, cfg.season, dfrom, dto)
+            fixtures = api.fetch_fixtures(team_id, cfg.season, dfrom, dto)
         except SystemExit:
             raise
         except Exception as exc:
