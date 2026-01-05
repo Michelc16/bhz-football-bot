@@ -1,0 +1,33 @@
+name: Sync Football Matches to Odoo
+
+on:
+  workflow_dispatch: {}     # permite rodar manualmente
+  schedule:
+    - cron: "0 10 * * *"    # todo dia 10:00 UTC (~07:00 Brasil em horário normal)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sync bot
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
+          APIFUT_TOKEN: ${{ secrets.APIFUT_TOKEN }}
+          APIFUT_BASE: ${{ secrets.APIFUT_BASE }}
+        run: |
+          python bot_agenda_futebol.py
