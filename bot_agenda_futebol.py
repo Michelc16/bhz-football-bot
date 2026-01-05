@@ -1,349 +1,340 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Bot externo para coletar agenda de jogos (ex: Mineiro 2026) e enviar para o endpoint
-do módulo Odoo (Agenda de Futebol BHZ) via POST /bhz/football/api/matches.
-
-Este arquivo NÃO depende de .env. Tudo é lido de variáveis de ambiente.
-Exemplo:
-  export ODOO_URL="https://SEU_DB.dev.odoo.com/bhz/football/api/matches"
-  export ODOO_TOKEN="SEU_TOKEN"
-  export APIFUT_TOKEN="SEU_TOKEN_API_FUTEBOL"
-  python bot_agenda_futebol.py
-"""
-
 import os
-import re
-import time
+import sys
 import json
-import hashlib
-from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+import time
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 
 
-# =========================
-# Config (ENV VARS)
-# =========================
-ODOO_URL = os.getenv("ODOO_URL", "").strip()
-ODOO_TOKEN = os.getenv("ODOO_TOKEN", "").strip()
-
-APIFUT_BASE = os.getenv("APIFUT_BASE", "https://www.api-futebol.com.br").strip()
-APIFUT_TOKEN = os.getenv("APIFUT_TOKEN", "").strip()
-
-# comportamento do bot
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
-RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))
-RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "10"))
-
-# alvo (por padrão: Cruzeiro, Atlético-MG, América-MG)
-TARGET_TEAM_ALIASES = {
-    "cruzeiro": "Cruzeiro",
-    "cruzeiro ec": "Cruzeiro",
-    "cruzeiro-esporte-clube": "Cruzeiro",
-
-    "atlético": "Atlético-MG",
-    "atletico": "Atlético-MG",
-    "atlético-mg": "Atlético-MG",
-    "atletico-mg": "Atlético-MG",
-    "clube-atletico-mineiro": "Atlético-MG",
-    "atlético mineiro": "Atlético-MG",
-    "atletico mineiro": "Atlético-MG",
-
-    "américa": "América-MG",
-    "america": "América-MG",
-    "américa-mg": "América-MG",
-    "america-mg": "América-MG",
-    "america futebol clube": "América-MG",
-}
+TZ_SP = ZoneInfo("America/Sao_Paulo")
 
 
-# =========================
-# Util
-# =========================
-def die(msg: str, code: int = 2) -> None:
-    raise SystemExit(f"[FATAL] {msg}")
+def _now_sp() -> datetime:
+    return datetime.now(TZ_SP)
 
 
-def slug(s: str) -> str:
-    s = (s or "").strip().lower()
-    # troca múltiplos espaços por "-"
-    s = re.sub(r"\s+", "-", s)
-    # remove caracteres estranhos, mantendo letras/números/traço e alguns acentos comuns
-    s = re.sub(r"[^a-z0-9\-áàâãéêíóôõúç\-]", "", s)
-    s = re.sub(r"\-+", "-", s).strip("-")
-    return s
+def _dt_to_odoo_str(dt: datetime) -> str:
+    # Odoo espera "YYYY-MM-DD HH:MM:SS"
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def normalize_team(name: str) -> Optional[str]:
+def _fatal(msg: str) -> None:
+    print(f"[FATAL] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _info(msg: str) -> None:
+    print(f"[INFO] {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"[WARN] {msg}", file=sys.stderr)
+
+
+def _get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
+    val = os.getenv(name, default)
+    if required and (val is None or str(val).strip() == ""):
+        _fatal(f"Variável {name} não definida.")
+    return val
+
+
+def _norm_bearer(token: str) -> str:
+    t = token.strip()
+    if t.lower().startswith("bearer "):
+        t = t.split(" ", 1)[1].strip()
+    return t
+
+
+@dataclass
+class RapidAPIConfig:
+    base: str
+    key: str
+    host: str
+    timeout: int = 30
+
+
+class APIFootballClient:
     """
-    Normaliza nomes variantes para o padrão usado no Odoo.
-    Se não for um dos times-alvo, retorna None.
+    Client para API-Football via RapidAPI.
+    Base típica: https://api-football-v1.p.rapidapi.com/v3
+    Headers: x-rapidapi-key, x-rapidapi-host
     """
-    raw = (name or "").strip()
-    if not raw:
-        return None
 
-    key = slug(raw).replace("-", " ").strip()
-    key2 = slug(raw).strip()
+    def __init__(self, cfg: RapidAPIConfig):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self.session.headers.update({
+            "x-rapidapi-key": cfg.key,
+            "x-rapidapi-host": cfg.host,
+            "accept": "application/json",
+        })
 
-    # remove "saf" e ruídos comuns
-    key = re.sub(r"\bsaf\b", "", key).strip()
-    key2 = re.sub(r"\bsaf\b", "", key2).strip()
-
-    # tenta match direto
-    if key in TARGET_TEAM_ALIASES:
-        return TARGET_TEAM_ALIASES[key]
-    if key2 in TARGET_TEAM_ALIASES:
-        return TARGET_TEAM_ALIASES[key2]
-
-    # fallback: contém palavras-chave
-    k = key.replace(" ", "")
-    if "cruzeiro" in k:
-        return "Cruzeiro"
-    if "atletico" in k or "atlético" in k:
-        return "Atlético-MG"
-    if "america" in k or "américa" in k:
-        return "América-MG"
-
-    return None
-
-
-def parse_datetime_to_odoo(value: str) -> Optional[str]:
-    """
-    Converte datas para "YYYY-MM-DD HH:MM:SS".
-    Aceita:
-      - ISO: "2026-01-10T16:30:00-03:00" / "2026-01-10T19:30:00Z"
-      - "YYYY-MM-DD HH:MM"
-      - "YYYY-MM-DD HH:MM:SS"
-    """
-    if not value:
-        return None
-    v = value.strip()
-
-    try:
-        if "T" in v:
-            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
-        else:
-            # tenta com segundos e sem segundos
-            if len(v) >= 19:
-                dt = datetime.strptime(v[:19], "%Y-%m-%d %H:%M:%S")
-            else:
-                dt = datetime.strptime(v[:16], "%Y-%m-%d %H:%M")
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def stable_external_id(source: str, competition: str, home: str, away: str, dt: str) -> str:
-    """
-    Gera external_id estável para permitir UPSERT no Odoo.
-    """
-    raw = f"{source}|{competition}|{home}|{away}|{dt}"
-    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14]
-    return f"{slug(competition)}/{slug(home)}-vs-{slug(away)}/{dt[:10]}/{h}"
-
-
-def dedupe_by_external_id(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for it in items:
-        eid = it.get("external_id")
-        if not eid or eid in seen:
-            continue
-        seen.add(eid)
-        out.append(it)
-    return out
-
-
-def validate_env() -> None:
-    if not ODOO_URL:
-        die("Variável ODOO_URL não definida.")
-    if not ODOO_TOKEN:
-        die("Variável ODOO_TOKEN não definida.")
-    if not APIFUT_TOKEN:
-        die("Variável APIFUT_TOKEN não definida.")
-
-
-# =========================
-# Provider: API Futebol
-# =========================
-def apifut_get(path: str) -> Any:
-    url = f"{APIFUT_BASE.rstrip('/')}/{path.lstrip('/')}"
-    r = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {APIFUT_TOKEN}"},
-        timeout=HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def apifut_collect_mineiro_2026() -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Coleta jogos do Campeonato Mineiro 2026.
-    Observação: a estrutura JSON pode variar por plano/endpoint.
-    O código é tolerante a chaves comuns ("fases", "rodadas", "jogos", etc.).
-    """
-    source = "bot_apifutebol_mineiro_2026"
-    competition = "Campeonato Mineiro"
-
-    # Endpoint "canônico" (pode exigir ajuste dependendo do seu plano)
-    campeonato_path = "campeonato/campeonato-mineiro/2026"
-    data = apifut_get(campeonato_path)
-
-    matches: List[Dict[str, Any]] = []
-
-    fases = data.get("fases") or []
-    for fase in fases:
-        rodadas = fase.get("rodadas") or fase.get("rodada") or []
-        for rodada in rodadas:
-            jogos = rodada.get("jogos") or rodada.get("partidas") or []
-            for j in jogos:
-                home_raw = (
-                    (j.get("time_mandante") or j.get("mandante") or {}).get("nome")
-                    or j.get("mandante")
-                    or ""
-                )
-                away_raw = (
-                    (j.get("time_visitante") or j.get("visitante") or {}).get("nome")
-                    or j.get("visitante")
-                    or ""
-                )
-                if not home_raw or not away_raw:
-                    continue
-
-                home_norm = normalize_team(str(home_raw))
-                away_norm = normalize_team(str(away_raw))
-
-                # filtra: só jogos que envolvem pelo menos um dos 3 times
-                if not home_norm and not away_norm:
-                    continue
-
-                dt_iso = (
-                    j.get("data_realizacao_iso")
-                    or j.get("data_realizacao")
-                    or j.get("data")
-                    or ""
-                )
-                match_dt = parse_datetime_to_odoo(str(dt_iso))
-                if not match_dt:
-                    continue
-
-                round_name = (rodada.get("nome") or rodada.get("descricao") or "").strip()
-
-                stadium = (j.get("estadio") or {}).get("nome") or j.get("estadio") or ""
-                city = (j.get("cidade") or {}).get("nome") or j.get("cidade") or ""
-
-                broadcast = j.get("transmissao") or ""
-                ticket_url = j.get("url_ingresso") or ""
-
-                home_team = home_norm or str(home_raw).strip()
-                away_team = away_norm or str(away_raw).strip()
-
-                matches.append(
-                    {
-                        "external_id": stable_external_id(
-                            "apifutebol",
-                            competition,
-                            home_team,
-                            away_team,
-                            match_dt,
-                        ),
-                        "match_datetime": match_dt,
-                        "competition": competition,
-                        "round": round_name or "",
-                        "home_team": home_team,
-                        "away_team": away_team,
-                        "stadium": str(stadium).strip(),
-                        "city": str(city).strip(),
-                        "broadcast": str(broadcast).strip(),
-                        "ticket_url": str(ticket_url).strip(),
-                    }
-                )
-
-    matches = dedupe_by_external_id(matches)
-    return source, matches
-
-
-# =========================
-# Push to Odoo
-# =========================
-def post_to_odoo(source: str, matches: List[Dict[str, Any]]) -> requests.Response:
-    payload = {"source": source, "matches": matches}
-
-    return requests.post(
-        ODOO_URL,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {ODOO_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        timeout=HTTP_TIMEOUT,
-    )
-
-
-def push_with_retry(source: str, matches: List[Dict[str, Any]]) -> None:
-    if not matches:
-        print("[INFO] Nenhum jogo encontrado para enviar.")
-        return
-
-    print(f"[INFO] Enviando {len(matches)} jogos para o Odoo…")
-    print(f"[INFO] ODOO_URL: {ODOO_URL}")
-    print(f"[INFO] SOURCE: {source}")
-
-    last_exc = None
-    for attempt in range(1, RETRY_MAX + 2):  # ex: RETRY_MAX=2 => 3 tentativas
+    def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url = self.cfg.base.rstrip("/") + "/" + path.lstrip("/")
+        r = self.session.get(url, params=params, timeout=self.cfg.timeout)
+        if r.status_code >= 400:
+            # Tenta imprimir contexto útil
+            try:
+                payload = r.json()
+            except Exception:
+                payload = r.text
+            _fatal(f"API-Football GET {url} falhou: {r.status_code} -> {payload}")
         try:
-            r = post_to_odoo(source, matches)
-            print("[INFO] Status:", r.status_code)
-
-            # sempre imprime body (ajuda debug)
-            body = r.text or ""
-            if len(body) > 5000:
-                body = body[:5000] + "\n... (truncado)"
-            print("[INFO] Resposta:", body)
-
-            if r.status_code in (200, 201):
-                print("[OK] Sync concluído com sucesso.")
-                return
-
-            # tenta retry em casos típicos
-            if r.status_code in (429, 500, 502, 503, 504):
-                if attempt <= (RETRY_MAX + 1) - 1:
-                    print(f"[WARN] Erro {r.status_code}. Tentando novamente em {RETRY_SLEEP_SECONDS}s… (tentativa {attempt})")
-                    time.sleep(RETRY_SLEEP_SECONDS)
-                    continue
-
-            # outros status => falha imediata
-            die(f"Falhou ao enviar para Odoo. HTTP {r.status_code}. Veja logs acima.", 1)
-
+            return r.json()
         except Exception as e:
-            last_exc = e
-            if attempt <= (RETRY_MAX + 1) - 1:
-                print(f"[WARN] Exceção: {e}. Tentando novamente em {RETRY_SLEEP_SECONDS}s… (tentativa {attempt})")
-                time.sleep(RETRY_SLEEP_SECONDS)
-                continue
-            die(f"Falha final após tentativas. Última exceção: {e}", 1)
+            _fatal(f"Resposta JSON inválida da API-Football em {url}: {e}")
 
-    if last_exc:
-        die(f"Falha final: {last_exc}", 1)
+    def find_team_id(self, team_name: str, country: str = "Brazil") -> int:
+        """
+        Resolve team_id via endpoint /teams (search).
+        Retorna o primeiro match exato (case-insensitive) ou o primeiro resultado.
+        """
+        data = self._get("teams", {"search": team_name, "country": country})
+        resp = data.get("response") or []
+        if not resp:
+            _fatal(f"Não encontrei time '{team_name}' na API-Football (country={country}).")
+
+        # Tenta match exato pelo nome
+        name_l = team_name.strip().lower()
+        for item in resp:
+            team = (item.get("team") or {})
+            nm = str(team.get("name") or "").strip().lower()
+            if nm == name_l:
+                return int(team["id"])
+
+        # Se não achou exato, pega o primeiro
+        team = (resp[0].get("team") or {})
+        return int(team["id"])
+
+    def get_fixtures_by_team(
+        self,
+        team_id: int,
+        season: int,
+        date_from: date,
+        date_to: date,
+        timezone: str = "America/Sao_Paulo",
+    ) -> List[Dict[str, Any]]:
+        """
+        Busca jogos (fixtures) por time, temporada e intervalo de datas.
+        """
+        params = {
+            "team": team_id,
+            "season": season,
+            "from": date_from.isoformat(),
+            "to": date_to.isoformat(),
+            "timezone": timezone,
+        }
+        data = self._get("fixtures", params)
+        return data.get("response") or []
 
 
-# =========================
-# Main
-# =========================
-def main() -> None:
-    validate_env()
+class OdooMatchesClient:
+    def __init__(self, odoo_url: str, odoo_token: str, timeout: int = 30):
+        self.url = odoo_url.rstrip("/")
+        self.token = _norm_bearer(odoo_token)
+        self.timeout = timeout
+        self.session = requests.Session()
 
-    # 1) coletar (Mineiro 2026 - API Futebol)
-    source, matches = apifut_collect_mineiro_2026()
+    def post_matches(self, source: str, matches: List[Dict[str, Any]], dry_run: bool = False) -> Dict[str, Any]:
+        payload = {"source": source, "matches": matches}
 
-    # 2) enviar para o Odoo
-    push_with_retry(source, matches)
+        if dry_run:
+            _info(f"[DRY-RUN] Não enviando ao Odoo. Seriam {len(matches)} partidas.")
+            # retorna algo “fake”
+            return {"dry_run": True, "count": len(matches), "payload_preview": payload}
+
+        r = self.session.post(
+            self.url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+            timeout=self.timeout,
+        )
+        if r.status_code >= 400:
+            try:
+                data = r.json()
+            except Exception:
+                data = r.text
+            _fatal(f"Odoo POST falhou: {r.status_code} -> {data}")
+
+        try:
+            return r.json()
+        except Exception:
+            return {"status_code": r.status_code, "text": r.text}
+
+
+def _parse_fixture_to_match(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Converte fixture da API-Football para o formato do seu módulo Odoo.
+    Campos esperados no endpoint do Odoo (conforme seu exemplo):
+      - external_id, match_datetime, competition, round, home_team, away_team,
+        stadium, city, broadcast, ticket_url
+    """
+    fixture = fx.get("fixture") or {}
+    league = fx.get("league") or {}
+    teams = fx.get("teams") or {}
+    venue = fixture.get("venue") or {}
+    status = (fixture.get("status") or {}).get("short") or ""
+
+    fixture_id = fixture.get("id")
+    if not fixture_id:
+        return None
+
+    # data/hora já vem ajustada com timezone se você passou timezone=America/Sao_Paulo
+    # Geralmente vem em fixture.date (ISO).
+    dt_iso = fixture.get("date")
+    if not dt_iso:
+        return None
+
+    # Parse ISO robusto (pode vir com offset)
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+        # Converte para São Paulo
+        dt = dt.astimezone(TZ_SP)
+    except Exception:
+        # fallback
+        return None
+
+    home = (teams.get("home") or {}).get("name") or ""
+    away = (teams.get("away") or {}).get("name") or ""
+
+    competition = str(league.get("name") or "").strip()
+    round_name = str(league.get("round") or "").strip()
+
+    stadium = str(venue.get("name") or "").strip()
+    city = str(venue.get("city") or "").strip()
+
+    # API-Football normalmente não fornece transmissão/ingresso.
+    # Mantemos vazio.
+    broadcast = ""
+    ticket_url = ""
+
+    # external_id estável (upsert)
+    external_id = f"AFB-{fixture_id}"
+
+    return {
+        "external_id": external_id,
+        "match_datetime": _dt_to_odoo_str(dt),
+        "competition": competition,
+        "round": round_name,
+        "home_team": home,
+        "away_team": away,
+        "stadium": stadium,
+        "city": city,
+        "broadcast": broadcast,
+        "ticket_url": ticket_url,
+        # Se seu endpoint aceitar campos extras, você pode enviar também:
+        # "status": status,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="BHZ Football Bot - Sync fixtures to Odoo (API-Football via RapidAPI)")
+    parser.add_argument("--dry-run", action="store_true", help="Não envia ao Odoo, só mostra contagem")
+    parser.add_argument("--season", type=int, default=int(os.getenv("FOOTBALL_SEASON", str(_now_sp().year))),
+                        help="Temporada (ex: 2026). Default: ano atual ou env FOOTBALL_SEASON")
+    parser.add_argument("--days-back", type=int, default=int(os.getenv("DAYS_BACK", "7")),
+                        help="Quantos dias para trás buscar. Default 7 (env DAYS_BACK)")
+    parser.add_argument("--days-ahead", type=int, default=int(os.getenv("DAYS_AHEAD", "180")),
+                        help="Quantos dias para frente buscar. Default 180 (env DAYS_AHEAD)")
+    parser.add_argument("--teams", type=str, default=os.getenv("TEAMS", "Cruzeiro,Atletico-MG,America-MG"),
+                        help="Lista de times separados por vírgula. Default: Cruzeiro,Atletico-MG,America-MG (env TEAMS)")
+    args = parser.parse_args()
+
+    # ---- Config env ----
+    apifut_base = _get_env("APIFUT_BASE", required=True)
+    rapid_key = _get_env("RAPIDAPI_KEY", required=True)
+    rapid_host = _get_env("RAPIDAPI_HOST", required=True)
+
+    odoo_url = _get_env("ODOO_URL", required=True)
+    odoo_token = _get_env("ODOO_TOKEN", required=True)
+
+    # ---- Clients ----
+    api = APIFootballClient(RapidAPIConfig(base=apifut_base, key=rapid_key, host=rapid_host))
+    odoo = OdooMatchesClient(odoo_url=odoo_url, odoo_token=odoo_token)
+
+    # ---- Parameters ----
+    today = _now_sp().date()
+    date_from = today - timedelta(days=args.days_back)
+    date_to = today + timedelta(days=args.days_ahead)
+
+    teams = [t.strip() for t in args.teams.split(",") if t.strip()]
+    if not teams:
+        _fatal("Nenhum time definido (use --teams ou env TEAMS).")
+
+    _info(f"Temporada: {args.season}")
+    _info(f"Janela: {date_from.isoformat()} -> {date_to.isoformat()}")
+    _info(f"Times: {teams}")
+    _info(f"Odoo endpoint: {odoo_url}")
+
+    # ---- Resolve team IDs ----
+    team_ids: Dict[str, int] = {}
+    for t in teams:
+        _info(f"Resolvendo time_id para '{t}'...")
+        tid = api.find_team_id(t, country="Brazil")
+        team_ids[t] = tid
+        _info(f"  -> {t} = {tid}")
+
+        # Pequena pausa para evitar rate-limit em contas free
+        time.sleep(0.3)
+
+    # ---- Fetch fixtures ----
+    fixtures_all: List[Dict[str, Any]] = []
+    for t, tid in team_ids.items():
+        _info(f"Buscando fixtures de {t} (id={tid})...")
+        fx = api.get_fixtures_by_team(team_id=tid, season=args.season, date_from=date_from, date_to=date_to,
+                                      timezone="America/Sao_Paulo")
+        _info(f"  -> {len(fx)} fixtures retornados")
+        fixtures_all.extend(fx)
+        time.sleep(0.3)
+
+    # ---- Convert + dedupe ----
+    matches: List[Dict[str, Any]] = []
+    seen_ext: Set[str] = set()
+
+    for fx in fixtures_all:
+        m = _parse_fixture_to_match(fx)
+        if not m:
+            continue
+        ext = m["external_id"]
+        if ext in seen_ext:
+            continue
+        seen_ext.add(ext)
+
+        # Filtra partidas sem nome de time (por segurança)
+        if not m.get("home_team") or not m.get("away_team"):
+            continue
+
+        matches.append(m)
+
+    # Ordena por data
+    try:
+        matches.sort(key=lambda x: x.get("match_datetime") or "")
+    except Exception:
+        pass
+
+    _info(f"Total de partidas após dedupe/normalização: {len(matches)}")
+
+    if not matches:
+        _warn("Nenhuma partida encontrada para enviar.")
+        return 0
+
+    # ---- Post to Odoo ----
+    source = os.getenv("SOURCE", "rapidapi_api_football")
+    resp = odoo.post_matches(source=source, matches=matches, dry_run=args.dry_run)
+
+    _info("Resposta do Odoo:")
+    print(json.dumps(resp, ensure_ascii=False, indent=2))
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

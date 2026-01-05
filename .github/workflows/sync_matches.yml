@@ -23,11 +23,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync bot
+      - name: Executar bot de sincronização
         env:
           ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
-          APIFUT_TOKEN: ${{ secrets.APIFUT_TOKEN }}
+          ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}          
           APIFUT_BASE: ${{ secrets.APIFUT_BASE }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
+          FOOTBALL_SEASON: "2026"
+          DAYS_BACK: "7"
+          DAYS_AHEAD: "180"
+          TEAMS: "Cruzeiro,Atletico-MG,America-MG"
         run: |
           python bot_agenda_futebol.py
