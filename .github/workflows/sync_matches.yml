@@ -1,13 +1,30 @@
 name: Sync Football Matches to Odoo
 
 on:
-  workflow_dispatch: {}     # permite rodar manualmente
+  workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *"    # todo dia 10:00 UTC (~07:00 Brasil em horário normal)
+    - cron: "0 9 * * *"   # todo dia 09:00 UTC (06:00 Brasil - ajuste se quiser)
 
 jobs:
   sync:
     runs-on: self-hosted
+
+    env:
+      # RapidAPI / API-Football
+      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+      RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
+      RAPIDAPI_BASE: https://api-football-v1.p.rapidapi.com
+
+      # Odoo
+      ODOO_URL: ${{ secrets.ODOO_URL }}
+      ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
+
+      # Parametrização
+      SEASON: "2026"
+      DAYS_BACK: "7"
+      DAYS_FORWARD: "180"
+      TEAMS: "Cruzeiro,Atletico-MG,America-MG"
+      COUNTRY: "Brazil"
 
     steps:
       - name: Checkout repo
@@ -23,16 +40,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Executar bot de sincronização
-        env:
-          ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}          
-          APIFUT_BASE: ${{ secrets.APIFUT_BASE }}
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
-          FOOTBALL_SEASON: "2026"
-          DAYS_BACK: "7"
-          DAYS_AHEAD: "180"
-          TEAMS: "Cruzeiro,Atletico-MG,America-MG"
+      - name: Run sync bot
         run: |
           python bot_agenda_futebol.py

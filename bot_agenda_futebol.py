@@ -1,338 +1,234 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import json
 import time
-import argparse
+import logging
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple, Set
+from datetime import datetime, timedelta, date
+from typing import Dict, Any, List, Optional
+from urllib.parse import urljoin
 
 import requests
 
-
-TZ_SP = ZoneInfo("America/Sao_Paulo")
-
-
-def _now_sp() -> datetime:
-    return datetime.now(TZ_SP)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("bhz-football-bot")
 
 
-def _dt_to_odoo_str(dt: datetime) -> str:
-    # Odoo espera "YYYY-MM-DD HH:MM:SS"
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def env_required(name: str) -> str:
+    v = os.getenv(name, "")
+    v = v.strip()
+    if not v:
+        raise SystemExit(f"[FATAL] Variável {name} não definida.")
+    # evita header inválido por newline/whitespace
+    if any(c in v for c in ["\n", "\r", "\t"]):
+        raise SystemExit(f"[FATAL] Variável {name} contém caracteres inválidos (quebra de linha/tab). Regrave o Secret.")
+    return v
 
 
-def _fatal(msg: str) -> None:
-    print(f"[FATAL] {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def _info(msg: str) -> None:
-    print(f"[INFO] {msg}")
-
-
-def _warn(msg: str) -> None:
-    print(f"[WARN] {msg}", file=sys.stderr)
-
-
-def _get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
-    val = os.getenv(name, default)
-    if required and (val is None or str(val).strip() == ""):
-        _fatal(f"Variável {name} não definida.")
-    return val
-
-
-def _norm_bearer(token: str) -> str:
-    t = token.strip()
-    if t.lower().startswith("bearer "):
-        t = t.split(" ", 1)[1].strip()
-    return t
+def safe_join(base: str, path: str) -> str:
+    base = base.strip()
+    path = path.strip()
+    if not base:
+        return path
+    if base.endswith("/") and path.startswith("/"):
+        return base[:-1] + path
+    if not base.endswith("/") and not path.startswith("/"):
+        return base + "/" + path
+    return base + path
 
 
 @dataclass
-class RapidAPIConfig:
-    base: str
-    key: str
-    host: str
-    timeout: int = 30
+class Config:
+    # RapidAPI / API-Football
+    rapidapi_key: str
+    rapidapi_host: str
+    rapidapi_base: str  # ex: https://api-football-v1.p.rapidapi.com
+
+    # Odoo
+    odoo_url: str       # endpoint completo OU base
+    odoo_token: str     # token puro (sem Bearer)
+
+    # comportamento
+    season: int
+    days_back: int
+    days_forward: int
+    teams: List[str]
+    country: str
+    timeout: int = 45
 
 
-class APIFootballClient:
+class RapidApiFootball:
     """
-    Client para API-Football via RapidAPI.
-    Base típica: https://api-football-v1.p.rapidapi.com/v3
-    Headers: x-rapidapi-key, x-rapidapi-host
+    API-Football via RapidAPI
+    Base típica: https://api-football-v1.p.rapidapi.com
+    Endpoints: /v3/teams, /v3/fixtures
     """
-
-    def __init__(self, cfg: RapidAPIConfig):
+    def __init__(self, cfg: Config):
         self.cfg = cfg
         self.session = requests.Session()
         self.session.headers.update({
-            "x-rapidapi-key": cfg.key,
-            "x-rapidapi-host": cfg.host,
-            "accept": "application/json",
+            "X-RapidAPI-Key": cfg.rapidapi_key.strip(),
+            "X-RapidAPI-Host": cfg.rapidapi_host.strip(),
         })
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        url = self.cfg.base.rstrip("/") + "/" + path.lstrip("/")
+        url = safe_join(self.cfg.rapidapi_base, path)
         r = self.session.get(url, params=params, timeout=self.cfg.timeout)
         if r.status_code >= 400:
-            # Tenta imprimir contexto útil
-            try:
-                payload = r.json()
-            except Exception:
-                payload = r.text
-            _fatal(f"API-Football GET {url} falhou: {r.status_code} -> {payload}")
-        try:
-            return r.json()
-        except Exception as e:
-            _fatal(f"Resposta JSON inválida da API-Football em {url}: {e}")
+            raise RuntimeError(f"RapidAPI {r.status_code} em {url}: {r.text[:300]}")
+        return r.json()
 
-    def find_team_id(self, team_name: str, country: str = "Brazil") -> int:
-        """
-        Resolve team_id via endpoint /teams (search).
-        Retorna o primeiro match exato (case-insensitive) ou o primeiro resultado.
-        """
-        data = self._get("teams", {"search": team_name, "country": country})
-        resp = data.get("response") or []
-        if not resp:
-            _fatal(f"Não encontrei time '{team_name}' na API-Football (country={country}).")
+    def find_team_id(self, team_name: str, country: str) -> int:
+        data = self._get("/v3/teams", {"search": team_name, "country": country})
+        items = data.get("response") or []
+        if not items:
+            raise RuntimeError(f"Time não encontrado na API-Football: {team_name} ({country})")
+        # pega o primeiro match
+        return int(items[0]["team"]["id"])
 
-        # Tenta match exato pelo nome
-        name_l = team_name.strip().lower()
-        for item in resp:
-            team = (item.get("team") or {})
-            nm = str(team.get("name") or "").strip().lower()
-            if nm == name_l:
-                return int(team["id"])
-
-        # Se não achou exato, pega o primeiro
-        team = (resp[0].get("team") or {})
-        return int(team["id"])
-
-    def get_fixtures_by_team(
-        self,
-        team_id: int,
-        season: int,
-        date_from: date,
-        date_to: date,
-        timezone: str = "America/Sao_Paulo",
-    ) -> List[Dict[str, Any]]:
-        """
-        Busca jogos (fixtures) por time, temporada e intervalo de datas.
-        """
-        params = {
+    def fixtures_by_team(self, team_id: int, season: int, dfrom: date, dto: date) -> List[Dict[str, Any]]:
+        data = self._get("/v3/fixtures", {
             "team": team_id,
             "season": season,
-            "from": date_from.isoformat(),
-            "to": date_to.isoformat(),
-            "timezone": timezone,
-        }
-        data = self._get("fixtures", params)
+            "from": dfrom.isoformat(),
+            "to": dto.isoformat(),
+        })
         return data.get("response") or []
 
 
-class OdooMatchesClient:
-    def __init__(self, odoo_url: str, odoo_token: str, timeout: int = 30):
-        self.url = odoo_url.rstrip("/")
-        self.token = _norm_bearer(odoo_token)
-        self.timeout = timeout
+class OdooClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.odoo_token.strip()}",
+        })
 
-    def post_matches(self, source: str, matches: List[Dict[str, Any]], dry_run: bool = False) -> Dict[str, Any]:
-        payload = {"source": source, "matches": matches}
+    def post_matches(self, matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # aceita tanto endpoint completo quanto base + path
+        url = self.cfg.odoo_url.strip()
+        if not url.startswith("http"):
+            raise RuntimeError("ODOO_URL inválida")
 
-        if dry_run:
-            _info(f"[DRY-RUN] Não enviando ao Odoo. Seriam {len(matches)} partidas.")
-            # retorna algo “fake”
-            return {"dry_run": True, "count": len(matches), "payload_preview": payload}
+        # Se usuário passou só base, completa
+        if not url.endswith("/bhz/football/api/matches"):
+            # tenta completar automaticamente
+            url = safe_join(url, "/bhz/football/api/matches")
 
-        r = self.session.post(
-            self.url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-            },
-            timeout=self.timeout,
-        )
+        payload = {"matches": matches}
+        r = self.session.post(url, data=json.dumps(payload), timeout=self.cfg.timeout)
         if r.status_code >= 400:
-            try:
-                data = r.json()
-            except Exception:
-                data = r.text
-            _fatal(f"Odoo POST falhou: {r.status_code} -> {data}")
-
+            raise RuntimeError(f"Odoo {r.status_code} em {url}: {r.text[:500]}")
         try:
             return r.json()
         except Exception:
-            return {"status_code": r.status_code, "text": r.text}
+            return {"ok": True, "raw": r.text}
 
 
-def _parse_fixture_to_match(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def normalize_fixture(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Converte fixture da API-Football para o formato do seu módulo Odoo.
-    Campos esperados no endpoint do Odoo (conforme seu exemplo):
-      - external_id, match_datetime, competition, round, home_team, away_team,
-        stadium, city, broadcast, ticket_url
+    Transforma o fixture da API-Football em payload que seu módulo Odoo espera.
+    Ajuste os campos se o seu endpoint exigir algo diferente.
     """
     fixture = fx.get("fixture") or {}
     league = fx.get("league") or {}
     teams = fx.get("teams") or {}
-    venue = fixture.get("venue") or {}
-    status = (fixture.get("status") or {}).get("short") or ""
+    goals = fx.get("goals") or {}
 
-    fixture_id = fixture.get("id")
-    if not fixture_id:
+    # data do jogo
+    dt = fixture.get("date")
+    if not dt:
         return None
 
-    # data/hora já vem ajustada com timezone se você passou timezone=America/Sao_Paulo
-    # Geralmente vem em fixture.date (ISO).
-    dt_iso = fixture.get("date")
-    if not dt_iso:
+    # Alguns módulos preferem datetime ISO sem timezone
+    # API-Football vem tipo: 2026-02-01T20:00:00+00:00
+    # vamos manter ISO (Odoo costuma aceitar)
+    external_id = str(fixture.get("id", ""))
+
+    home = (teams.get("home") or {}).get("name")
+    away = (teams.get("away") or {}).get("name")
+
+    # Segurança
+    if not external_id or not home or not away:
         return None
-
-    # Parse ISO robusto (pode vir com offset)
-    try:
-        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
-        # Converte para São Paulo
-        dt = dt.astimezone(TZ_SP)
-    except Exception:
-        # fallback
-        return None
-
-    home = (teams.get("home") or {}).get("name") or ""
-    away = (teams.get("away") or {}).get("name") or ""
-
-    competition = str(league.get("name") or "").strip()
-    round_name = str(league.get("round") or "").strip()
-
-    stadium = str(venue.get("name") or "").strip()
-    city = str(venue.get("city") or "").strip()
-
-    # API-Football normalmente não fornece transmissão/ingresso.
-    # Mantemos vazio.
-    broadcast = ""
-    ticket_url = ""
-
-    # external_id estável (upsert)
-    external_id = f"AFB-{fixture_id}"
 
     return {
         "external_id": external_id,
-        "match_datetime": _dt_to_odoo_str(dt),
-        "competition": competition,
-        "round": round_name,
+        "match_datetime": dt,
+        "competition": league.get("name"),
+        "season": league.get("season"),
+        "round": league.get("round"),
         "home_team": home,
         "away_team": away,
-        "stadium": stadium,
-        "city": city,
-        "broadcast": broadcast,
-        "ticket_url": ticket_url,
-        # Se seu endpoint aceitar campos extras, você pode enviar também:
-        # "status": status,
+        "home_goals": goals.get("home"),
+        "away_goals": goals.get("away"),
+        "status": (fixture.get("status") or {}).get("short"),
+        "venue": (fixture.get("venue") or {}).get("name"),
+        "raw": fx,  # útil pra debug
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BHZ Football Bot - Sync fixtures to Odoo (API-Football via RapidAPI)")
-    parser.add_argument("--dry-run", action="store_true", help="Não envia ao Odoo, só mostra contagem")
-    parser.add_argument("--season", type=int, default=int(os.getenv("FOOTBALL_SEASON", str(_now_sp().year))),
-                        help="Temporada (ex: 2026). Default: ano atual ou env FOOTBALL_SEASON")
-    parser.add_argument("--days-back", type=int, default=int(os.getenv("DAYS_BACK", "7")),
-                        help="Quantos dias para trás buscar. Default 7 (env DAYS_BACK)")
-    parser.add_argument("--days-ahead", type=int, default=int(os.getenv("DAYS_AHEAD", "180")),
-                        help="Quantos dias para frente buscar. Default 180 (env DAYS_AHEAD)")
-    parser.add_argument("--teams", type=str, default=os.getenv("TEAMS", "Cruzeiro,Atletico-MG,America-MG"),
-                        help="Lista de times separados por vírgula. Default: Cruzeiro,Atletico-MG,America-MG (env TEAMS)")
-    args = parser.parse_args()
+    # ---- Config via env/secrets ----
+    cfg = Config(
+        rapidapi_key=env_required("RAPIDAPI_KEY"),
+        rapidapi_host=env_required("RAPIDAPI_HOST"),
+        rapidapi_base=os.getenv("RAPIDAPI_BASE", "https://api-football-v1.p.rapidapi.com").strip(),
 
-    # ---- Config env ----
-    apifut_base = _get_env("APIFUT_BASE", required=True)
-    rapid_key = _get_env("RAPIDAPI_KEY", required=True)
-    rapid_host = _get_env("RAPIDAPI_HOST", required=True)
+        odoo_url=env_required("ODOO_URL"),
+        odoo_token=env_required("ODOO_TOKEN"),
 
-    odoo_url = _get_env("ODOO_URL", required=True)
-    odoo_token = _get_env("ODOO_TOKEN", required=True)
+        season=int(os.getenv("SEASON", "2026").strip() or "2026"),
+        days_back=int(os.getenv("DAYS_BACK", "7").strip() or "7"),
+        days_forward=int(os.getenv("DAYS_FORWARD", "180").strip() or "180"),
+        teams=[t.strip() for t in (os.getenv("TEAMS", "Cruzeiro,Atletico-MG,America-MG")).split(",") if t.strip()],
+        country=os.getenv("COUNTRY", "Brazil").strip() or "Brazil",
+    )
 
-    # ---- Clients ----
-    api = APIFootballClient(RapidAPIConfig(base=apifut_base, key=rapid_key, host=rapid_host))
-    odoo = OdooMatchesClient(odoo_url=odoo_url, odoo_token=odoo_token)
+    log.info(f"[INFO] Temporada: {cfg.season}")
+    today = datetime.utcnow().date()
+    dfrom = today - timedelta(days=cfg.days_back)
+    dto = today + timedelta(days=cfg.days_forward)
+    log.info(f"[INFO] Janela: {dfrom} -> {dto}")
+    log.info(f"[INFO] Times: {cfg.teams}")
+    log.info(f"[INFO] RapidAPI base: {cfg.rapidapi_base}")
+    log.info(f"[INFO] Odoo endpoint: {cfg.odoo_url}")
 
-    # ---- Parameters ----
-    today = _now_sp().date()
-    date_from = today - timedelta(days=args.days_back)
-    date_to = today + timedelta(days=args.days_ahead)
+    api = RapidApiFootball(cfg)
+    odoo = OdooClient(cfg)
 
-    teams = [t.strip() for t in args.teams.split(",") if t.strip()]
-    if not teams:
-        _fatal("Nenhum time definido (use --teams ou env TEAMS).")
+    all_matches: List[Dict[str, Any]] = []
+    for team_name in cfg.teams:
+        log.info(f"[INFO] Resolvendo team_id para '{team_name}'...")
+        team_id = api.find_team_id(team_name, country=cfg.country)
+        log.info(f"[INFO] team_id '{team_name}': {team_id}")
 
-    _info(f"Temporada: {args.season}")
-    _info(f"Janela: {date_from.isoformat()} -> {date_to.isoformat()}")
-    _info(f"Times: {teams}")
-    _info(f"Odoo endpoint: {odoo_url}")
+        fixtures = api.fixtures_by_team(team_id, season=cfg.season, dfrom=dfrom, dto=dto)
+        log.info(f"[INFO] Fixtures retornados para {team_name}: {len(fixtures)}")
 
-    # ---- Resolve team IDs ----
-    team_ids: Dict[str, int] = {}
-    for t in teams:
-        _info(f"Resolvendo time_id para '{t}'...")
-        tid = api.find_team_id(t, country="Brazil")
-        team_ids[t] = tid
-        _info(f"  -> {t} = {tid}")
+        for fx in fixtures:
+            nm = normalize_fixture(fx)
+            if nm:
+                all_matches.append(nm)
 
-        # Pequena pausa para evitar rate-limit em contas free
-        time.sleep(0.3)
+        # evita rate-limit
+        time.sleep(0.25)
 
-    # ---- Fetch fixtures ----
-    fixtures_all: List[Dict[str, Any]] = []
-    for t, tid in team_ids.items():
-        _info(f"Buscando fixtures de {t} (id={tid})...")
-        fx = api.get_fixtures_by_team(team_id=tid, season=args.season, date_from=date_from, date_to=date_to,
-                                      timezone="America/Sao_Paulo")
-        _info(f"  -> {len(fx)} fixtures retornados")
-        fixtures_all.extend(fx)
-        time.sleep(0.3)
-
-    # ---- Convert + dedupe ----
-    matches: List[Dict[str, Any]] = []
-    seen_ext: Set[str] = set()
-
-    for fx in fixtures_all:
-        m = _parse_fixture_to_match(fx)
-        if not m:
-            continue
-        ext = m["external_id"]
-        if ext in seen_ext:
-            continue
-        seen_ext.add(ext)
-
-        # Filtra partidas sem nome de time (por segurança)
-        if not m.get("home_team") or not m.get("away_team"):
-            continue
-
-        matches.append(m)
-
-    # Ordena por data
-    try:
-        matches.sort(key=lambda x: x.get("match_datetime") or "")
-    except Exception:
-        pass
-
-    _info(f"Total de partidas após dedupe/normalização: {len(matches)}")
+    # dedup por external_id
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for m in all_matches:
+        dedup[m["external_id"]] = m
+    matches = list(dedup.values())
+    log.info(f"[INFO] Total normalizado (dedup): {len(matches)}")
 
     if not matches:
-        _warn("Nenhuma partida encontrada para enviar.")
+        log.info("[INFO] Nada para enviar.")
         return 0
 
-    # ---- Post to Odoo ----
-    source = os.getenv("SOURCE", "rapidapi_api_football")
-    resp = odoo.post_matches(source=source, matches=matches, dry_run=args.dry_run)
-
-    _info("Resposta do Odoo:")
-    print(json.dumps(resp, ensure_ascii=False, indent=2))
-
+    resp = odoo.post_matches(matches)
+    log.info(f"[OK] Enviado para Odoo. Resposta: {json.dumps(resp)[:500]}")
     return 0
 
 
