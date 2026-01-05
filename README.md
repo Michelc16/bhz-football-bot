@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # BHZ Football Bot (GitHub Actions)
 
 Bot externo para buscar agenda de jogos (Cruzeiro, Atlético-MG e América-MG) e enviar para o módulo **Agenda de Futebol** no seu Odoo.sh via endpoint REST:
