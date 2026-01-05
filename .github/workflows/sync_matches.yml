@@ -35,6 +35,7 @@ jobs:
         env:
           RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          RAPIDAPI_BASE: ${{ secrets.RAPIDAPI_BASE }}
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
         run: |
