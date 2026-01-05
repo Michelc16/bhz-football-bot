@@ -10,15 +10,6 @@ jobs:
     runs-on: self-hosted
 
     env:
-      # RapidAPI / API-Football
-      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-      RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
-      RAPIDAPI_BASE: https://api-football-v1.p.rapidapi.com
-
-      # Odoo
-      ODOO_URL: ${{ secrets.ODOO_URL }}
-      ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
-
       # Parametrização
       SEASON: "2026"
       DAYS_BACK: "7"
@@ -41,5 +32,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run sync bot
+        env:
+          RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_TOKEN: ${{ secrets.ODOO_TOKEN }}
         run: |
           python bot_agenda_futebol.py
