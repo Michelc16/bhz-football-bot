@@ -11,6 +11,7 @@ import requests
 
 DEFAULT_RAPIDAPI_BASE = "https://sportapi7.p.rapidapi.com"
 DEFAULT_MAX_EVENT_PAGES = 4
+NORMALIZED_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 # IDs baseados no catálogo público da SportAPI (RapidAPI). Ajuste se necessário.
 DEFAULT_TEAM_IDS = {
     "cruzeiro": 4249,
@@ -308,11 +309,11 @@ class SportAPIClient:
                     try:
                         payload = self._get(path)
                     except FileNotFoundError:
-                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Continuando discovery.")
-                        continue
+                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Encerrando paginação.")
+                        break
                 chunk = self._extract_events_from_payload(payload or {})
                 if not chunk:
-                    continue
+                    break
                 events.extend(chunk)
 
         elif selection.mode == "query":
@@ -328,11 +329,11 @@ class SportAPIClient:
                     try:
                         payload = self._get(path, params=params)
                     except FileNotFoundError:
-                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Continuando discovery.")
-                        continue
+                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Encerrando paginação.")
+                        break
                 chunk = self._extract_events_from_payload(payload or {})
                 if not chunk:
-                    continue
+                    break
                 events.extend(chunk)
 
         else:  # single
@@ -424,6 +425,32 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
     return None
 
 
+def normalize_datetime(value: str) -> Optional[str]:
+    """
+    Converte qualquer string datetime/ISO para o formato exigido pelo Odoo (YYYY-MM-DD HH:MM:SS).
+    Mantemos o horário informado pela API (sem converter fuso) e removemos timezone se existir.
+    """
+    if value is None:
+        return None
+    dt = _parse_timestamp(value)
+    if not dt:
+        return None
+    if dt.tzinfo is not None:
+        # mantemos o horário informado, apenas removendo a info de fuso
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime(NORMALIZED_DATETIME_FORMAT)
+
+
+def parse_normalized_datetime(value: str) -> Optional[datetime]:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, NORMALIZED_DATETIME_FORMAT)
+    except ValueError:
+        return None
+
+
 def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     event_id = event.get("id") or event.get("eventId") or event.get("event_id")
     if not event_id:
@@ -437,6 +464,10 @@ def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
     dt_parsed = _parse_timestamp(dt_value)
     if not dt_parsed:
+        return None
+
+    normalized_dt = normalize_datetime(dt_parsed.isoformat())
+    if not normalized_dt:
         return None
 
     home_name = _extract_team_name(event.get("homeTeam") or event.get("home_team") or event.get("home"))
@@ -470,7 +501,7 @@ def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return {
         "external_id": str(event_id),
-        "match_datetime": dt_parsed.isoformat(),
+        "match_datetime": normalized_dt,
         "competition": competition_name,
         "season": event.get("season") or competition_season,
         "round": round_name,
@@ -482,6 +513,19 @@ def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "venue": venue_name,
         "raw": event,
     }
+
+
+def event_matches_team(event: Dict[str, Any], team_name: str) -> bool:
+    target = (team_name or "").strip().lower()
+    if not target:
+        return True
+    for key in ("home_team", "away_team"):
+        name = (event.get(key) or "").strip().lower()
+        if not name:
+            continue
+        if name == target or target in name or name in target:
+            return True
+    return False
 
 
 def main() -> int:
@@ -557,10 +601,19 @@ def main() -> int:
             normalized = normalize_event(event)
             if not normalized:
                 continue
-            event_dt = datetime.fromisoformat(normalized["match_datetime"])
+            event_dt = parse_normalized_datetime(normalized["match_datetime"])
+            if not event_dt:
+                log.warning(f"[WARN] Datetime inválido no evento {normalized.get('external_id')} - ignorando.")
+                continue
             if event_dt.date() < dfrom or event_dt.date() > dto:
                 continue
+            if not event_matches_team(normalized, team_name):
+                continue
             team_matches.append(normalized)
+
+        if not team_matches:
+            log.warning(f"[WARN] Nenhuma partida válida encontrada para '{team_name}' (team_id {team_id}).")
+            continue
 
         log.info(f"[INFO] Quantidade de jogos encontrados para {team_name}: {len(team_matches)}")
         all_matches.extend(team_matches)
