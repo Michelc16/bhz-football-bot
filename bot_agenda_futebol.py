@@ -4,7 +4,7 @@ import json
 import time
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -81,6 +81,14 @@ def build_team_id_map() -> Dict[str, int]:
     return mapping
 
 
+def to_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raise TypeError(f"Valor '{value}' não é datetime/date.")
+
+
 class FreeFootballAPIClient:
     """Client para Free API Live Football Data (RapidAPI)."""
 
@@ -146,12 +154,14 @@ class FreeFootballAPIClient:
 
         raise RuntimeError(f"Free API falhou após {self.cfg.retry_max} tentativas em {path}")
 
-    def fixtures_by_team(self, team_id: int, season: int, dfrom: datetime, dto: datetime) -> List[Dict[str, Any]]:
+    def fixtures_by_team(self, team_id: int, season: int, dfrom: date, dto: date) -> List[Dict[str, Any]]:
+        from_date = to_date(dfrom)
+        to_date_value = to_date(dto)
         params = {
             "team": team_id,
             "season": season,
-            "from": dfrom.date().isoformat(),
-            "to": dto.date().isoformat(),
+            "from": from_date.isoformat(),
+            "to": to_date_value.isoformat(),
         }
         data = self._get("/fixtures", params=params)
         fixtures = (
@@ -363,9 +373,9 @@ def main() -> int:
     )
 
     log.info(f"[INFO] Temporada: {cfg.season}")
-    today = datetime.utcnow().date()
-    dfrom = today - timedelta(days=cfg.days_back)
-    dto = today + timedelta(days=cfg.days_forward)
+    today = to_date(datetime.utcnow())
+    dfrom = to_date(today - timedelta(days=cfg.days_back))
+    dto = to_date(today + timedelta(days=cfg.days_forward))
     log.info(f"[INFO] Janela: {dfrom} -> {dto}")
     log.info(f"[INFO] Times: {cfg.teams}")
     log.info(f"[INFO] RapidAPI base: {cfg.rapidapi_base}")
@@ -410,7 +420,8 @@ def main() -> int:
             if not event_dt:
                 log.warning(f"[WARN] Datetime inválido no evento {normalized.get('external_id')} - ignorando.")
                 continue
-            if event_dt.date() < dfrom or event_dt.date() > dto:
+            event_date = to_date(event_dt)
+            if event_date < dfrom or event_date > dto:
                 continue
             if not event_matches_team(normalized, team_name):
                 continue
