@@ -4,11 +4,13 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import pytz
 import requests
 from dateutil import parser as dateparser
+from dotenv import load_dotenv
 
 from providers import fetch_matches as fetch_ge_mineiro_matches
 
@@ -33,6 +35,11 @@ TEAM_ALIASES = {
 }
 
 
+BASE_DIR = Path(__file__).resolve().parent
+DOTENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=DOTENV_PATH)
+
+
 def canonicalize_team(name: str) -> str:
     if not name:
         return name
@@ -53,7 +60,14 @@ class Config:
 def env_required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise SystemExit(f"[FATAL] Variável {name} não definida.")
+        if name == "ODOO_URL":
+            log.error("[FATAL] Variável ODOO_URL não definida.")
+            log.info(f"[INFO] Diretório atual: {os.getcwd()}")
+            log.info(f"[INFO] Caminho .env esperado: {DOTENV_PATH}")
+            log.info("[INFO] Se o arquivo estiver como 'env', renomeie para '.env'.")
+        else:
+            log.error(f"[FATAL] Variável {name} não definida.")
+        raise SystemExit(1)
     return value
 
 
