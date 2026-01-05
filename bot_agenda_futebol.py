@@ -5,12 +5,11 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 
-DEFAULT_RAPIDAPI_BASE = "https://sportapi7.p.rapidapi.com"
-DEFAULT_MAX_EVENT_PAGES = 4
+DEFAULT_RAPIDAPI_BASE = "https://free-api-live-football-data.p.rapidapi.com"
 NORMALIZED_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 # IDs baseados no catálogo público da SportAPI (RapidAPI). Ajuste se necessário.
 DEFAULT_TEAM_IDS = {
@@ -60,17 +59,6 @@ class Config:
     country: str
     timeout: int = 45
     retry_max: int = 3
-    max_event_pages: int = DEFAULT_MAX_EVENT_PAGES
-    team_search_path: Optional[str] = None
-
-
-@dataclass
-class EndpointSelection:
-    mode: str  # slash, query, single
-    template: str
-    params: Optional[Dict[str, Any]] = None
-    first_page: Optional[int] = None
-    first_payload: Optional[Dict[str, Any]] = None
 
 
 def normalize_team_key(name: str) -> str:
@@ -93,8 +81,8 @@ def build_team_id_map() -> Dict[str, int]:
     return mapping
 
 
-class SportAPIClient:
-    """Client para SportAPI (RapidAPI)."""
+class FreeFootballAPIClient:
+    """Client para Free API Live Football Data (RapidAPI)."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -118,7 +106,7 @@ class SportAPIClient:
                 resp = self.session.get(url, params=params, timeout=self.cfg.timeout)
             except requests.Timeout:
                 log.warning(
-                    f"[WARN] SportAPI timeout (tentativa {attempt}/{self.cfg.retry_max}) em {path}"
+                    f"[WARN] Free API timeout (tentativa {attempt}/{self.cfg.retry_max}) em {path}"
                 )
                 if attempt >= self.cfg.retry_max:
                     raise
@@ -127,7 +115,7 @@ class SportAPIClient:
                 continue
             except requests.RequestException as exc:
                 log.warning(
-                    f"[WARN] SportAPI erro de rede (tentativa {attempt}/{self.cfg.retry_max}): {exc}"
+                    f"[WARN] Free API erro de rede (tentativa {attempt}/{self.cfg.retry_max}): {exc}"
                 )
                 if attempt >= self.cfg.retry_max:
                     raise
@@ -139,10 +127,6 @@ class SportAPIClient:
                 log.error("[ERROR] RapidAPI retornou 403 (assinatura ausente ou bloqueada).")
                 log.error(resp.text[:300])
                 raise SystemExit(1)
-
-            if resp.status_code == 404:
-                log.error(f"[ERROR] RapidAPI 404 em {url}. Verifique se o path /api/v1 está correto.")
-                raise FileNotFoundError(f"RapidAPI 404 em {url}")
 
             if resp.status_code == 429:
                 log.warning(f"[WARN] RapidAPI limitou (429) tentativa {attempt}/{self.cfg.retry_max}")
@@ -158,192 +142,28 @@ class SportAPIClient:
             try:
                 return resp.json()
             except ValueError as exc:
-                raise RuntimeError(f"Resposta inválida da SportAPI em {url}: {exc}")
+                raise RuntimeError(f"Resposta inválida da Free API em {url}: {exc}")
 
-        raise RuntimeError(f"SportAPI falhou após {self.cfg.retry_max} tentativas em {path}")
+        raise RuntimeError(f"Free API falhou após {self.cfg.retry_max} tentativas em {path}")
 
-    @staticmethod
-    def _extract_events_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not isinstance(payload, dict):
-            return []
-        for key in ("events", "data", "results"):
-            items = payload.get(key)
-            if isinstance(items, list):
-                return items
-        return []
-
-    def fetch_team_events_next(self, team_id: int) -> Optional[EndpointSelection]:
-        attempts = [
-            {
-                "mode": "slash",
-                "template": "/api/v1/team/{team_id}/events/next/{page}",
-                "page": 0,
-                "label": "/api/v1/team/{team_id}/events/next/0",
-            },
-            {
-                "mode": "slash",
-                "template": "/api/v1/team/{team_id}/events/next/{page}",
-                "page": 1,
-                "label": "/api/v1/team/{team_id}/events/next/1",
-            },
-            {
-                "mode": "query",
-                "template": "/api/v1/team/{team_id}/events/next",
-                "page": 0,
-                "label": "/api/v1/team/{team_id}/events/next?page=0",
-            },
-            {
-                "mode": "query",
-                "template": "/api/v1/team/{team_id}/events/next",
-                "page": 1,
-                "label": "/api/v1/team/{team_id}/events/next?page=1",
-            },
-            {
-                "mode": "single",
-                "template": "/api/v1/team/{team_id}/events/next",
-                "label": "/api/v1/team/{team_id}/events/next",
-            },
-        ]
-
-        for attempt in attempts:
-            mode = attempt["mode"]
-            template = attempt["template"]
-            try:
-                if mode == "slash":
-                    page = attempt["page"]
-                    path = template.format(team_id=team_id, page=page)
-                    payload = self._get(path)
-                    log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}")
-                    return EndpointSelection(
-                        mode="slash",
-                        template=template,
-                        first_page=page,
-                        first_payload=payload,
-                    )
-                if mode == "query":
-                    page = attempt["page"]
-                    path = template.format(team_id=team_id)
-                    base_params = dict(attempt.get("params", {}))
-                    params = dict(base_params)
-                    params["page"] = page
-                    payload = self._get(path, params=params)
-                    log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}?page={page}")
-                    return EndpointSelection(
-                        mode="query",
-                        template=template,
-                        params=base_params,
-                        first_page=page,
-                        first_payload=payload,
-                    )
-                path = template.format(team_id=team_id)
-                payload = self._get(path)
-                log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}")
-                return EndpointSelection(
-                    mode="single",
-                    template=template,
-                    first_payload=payload,
-                )
-            except FileNotFoundError:
-                continue
-
-        log.error(f"[ERROR] Nenhum endpoint válido encontrado (todos retornaram 404) para team_id {team_id}.")
-        return None
-
-    def search_team_id(self, team_name: str, country: str) -> Optional[int]:
-        if not self.cfg.team_search_path:
-            return None
-        params: Dict[str, Any] = {
-            "name": team_name,
-            "team": team_name,
-            "query": team_name,
-            "q": team_name,
+    def fixtures_by_team(self, team_id: int, season: int, dfrom: datetime, dto: datetime) -> List[Dict[str, Any]]:
+        params = {
+            "team": team_id,
+            "season": season,
+            "from": dfrom.date().isoformat(),
+            "to": dto.date().isoformat(),
         }
-        if country:
-            params["country"] = country
-        try:
-            data = self._get(self.cfg.team_search_path, params=params)
-        except FileNotFoundError:
-            log.warning(
-                f"[WARN] Endpoint de busca configurado '{self.cfg.team_search_path}' retornou 404. Usando fallback."
-            )
-            return None
-        except Exception as exc:
-            log.warning(f"[WARN] Falha na busca de team_id na SportAPI: {exc}")
-            return None
-
-        teams = data.get("teams") or data.get("data") or data.get("results") or []
-        normalized_country = (country or "").strip().lower()
-        for team in teams:
-            tid = team.get("id") or team.get("team_id")
-            if tid is None:
-                continue
-            if normalized_country:
-                team_country = ""
-                country_block = team.get("country") or {}
-                if isinstance(country_block, dict):
-                    team_country = (country_block.get("name") or country_block.get("code") or "").lower()
-                elif isinstance(country_block, str):
-                    team_country = country_block.lower()
-                if team_country and normalized_country not in team_country:
-                    continue
-            try:
-                return int(tid)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def events_by_team(self, team_id: int) -> Tuple[List[Dict[str, Any]], bool]:
-        selection = self.fetch_team_events_next(team_id)
-        if not selection:
-            return [], False
-
-        events: List[Dict[str, Any]] = []
-
-        if selection.mode == "slash":
-            for page in range(self.cfg.max_event_pages):
-                payload: Optional[Dict[str, Any]] = None
-                if selection.first_page == page and selection.first_payload is not None:
-                    payload = selection.first_payload
-                else:
-                    path = selection.template.format(team_id=team_id, page=page)
-                    try:
-                        payload = self._get(path)
-                    except FileNotFoundError:
-                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Encerrando paginação.")
-                        break
-                chunk = self._extract_events_from_payload(payload or {})
-                if not chunk:
-                    break
-                events.extend(chunk)
-
-        elif selection.mode == "query":
-            base_params = dict(selection.params or {})
-            for page in range(self.cfg.max_event_pages):
-                payload = None
-                if selection.first_page == page and selection.first_payload is not None:
-                    payload = selection.first_payload
-                else:
-                    params = dict(base_params)
-                    params["page"] = page
-                    path = selection.template.format(team_id=team_id)
-                    try:
-                        payload = self._get(path, params=params)
-                    except FileNotFoundError:
-                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Encerrando paginação.")
-                        break
-                chunk = self._extract_events_from_payload(payload or {})
-                if not chunk:
-                    break
-                events.extend(chunk)
-
-        else:  # single
-            payload = selection.first_payload
-            if payload is None:
-                payload = self._get(selection.template.format(team_id=team_id))
-            chunk = self._extract_events_from_payload(payload or {})
-            events.extend(chunk)
-
-        return events, True
+        data = self._get("/fixtures", params=params)
+        fixtures = (
+            data.get("response")
+            or data.get("fixtures")
+            or data.get("data")
+            or data.get("results")
+            or []
+        )
+        if not isinstance(fixtures, list):
+            return []
+        return fixtures
 
 
 class OdooClient:
@@ -451,16 +271,21 @@ def parse_normalized_datetime(value: str) -> Optional[datetime]:
         return None
 
 
-def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    event_id = event.get("id") or event.get("eventId") or event.get("event_id")
+def normalize_fixture(fixture_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fixture = fixture_payload.get("fixture") or {}
+    league = fixture_payload.get("league") or {}
+    teams = fixture_payload.get("teams") or {}
+    venue = fixture_payload.get("venue") or {}
+    goals = fixture_payload.get("goals") or {}
+
+    event_id = fixture.get("id") or fixture_payload.get("id")
     if not event_id:
         return None
 
     dt_value = (
-        event.get("startTimestamp")
-        or event.get("start_time")
-        or event.get("startTime")
-        or event.get("start_at")
+        fixture.get("date")
+        or fixture.get("timestamp")
+        or fixture_payload.get("date")
     )
     dt_parsed = _parse_timestamp(dt_value)
     if not dt_parsed:
@@ -470,30 +295,23 @@ def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not normalized_dt:
         return None
 
-    home_name = _extract_team_name(event.get("homeTeam") or event.get("home_team") or event.get("home"))
-    away_name = _extract_team_name(event.get("awayTeam") or event.get("away_team") or event.get("away"))
+    home_name = _extract_team_name((teams.get("home") or {}))
+    away_name = _extract_team_name((teams.get("away") or {}))
     if not home_name or not away_name:
         return None
 
-    tournament = event.get("tournament") or event.get("league") or {}
-    competition_name = None
-    competition_season = None
-    if isinstance(tournament, dict):
-        competition_name = tournament.get("name")
-        competition_season = tournament.get("season")
-    elif isinstance(tournament, str):
-        competition_name = tournament
+    competition_name = league.get("name")
+    competition_season = league.get("season")
 
-    status_block = event.get("status") or {}
+    status_block = fixture.get("status") or {}
     if isinstance(status_block, dict):
-        status = status_block.get("description") or status_block.get("type")
+        status = status_block.get("long") or status_block.get("short") or status_block.get("type")
     else:
         status = status_block
 
-    venue_block = event.get("venue") or {}
-    venue_name = venue_block.get("name") if isinstance(venue_block, dict) else venue_block
+    venue_name = venue.get("name") if isinstance(venue, dict) else venue
 
-    round_info = event.get("round") or event.get("stage")
+    round_info = league.get("round") or fixture_payload.get("round")
     if isinstance(round_info, dict):
         round_name = round_info.get("name")
     else:
@@ -503,15 +321,15 @@ def normalize_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "external_id": str(event_id),
         "match_datetime": normalized_dt,
         "competition": competition_name,
-        "season": event.get("season") or competition_season,
+        "season": fixture.get("season") or competition_season,
         "round": round_name,
         "home_team": home_name,
         "away_team": away_name,
-        "home_goals": _extract_score(event.get("homeScore") or event.get("home_score")),
-        "away_goals": _extract_score(event.get("awayScore") or event.get("away_score")),
+        "home_goals": _extract_score(goals.get("home")),
+        "away_goals": _extract_score(goals.get("away")),
         "status": status,
         "venue": venue_name,
-        "raw": event,
+        "raw": fixture_payload,
     }
 
 
@@ -542,8 +360,6 @@ def main() -> int:
         country=os.getenv("COUNTRY", "Brazil").strip() or "Brazil",
         timeout=int(os.getenv("HTTP_TIMEOUT", "45").strip() or "45"),
         retry_max=int(os.getenv("RETRY_MAX", "3").strip() or "3"),
-        max_event_pages=int(os.getenv("SPORTAPI_MAX_PAGES", str(DEFAULT_MAX_EVENT_PAGES)).strip() or str(DEFAULT_MAX_EVENT_PAGES)),
-        team_search_path=os.getenv("SPORTAPI_TEAM_SEARCH_PATH", "").strip() or None,
     )
 
     log.info(f"[INFO] Temporada: {cfg.season}")
@@ -557,7 +373,7 @@ def main() -> int:
     log.info("[INFO] Credenciais RapidAPI/Odoo mascaradas por segurança.")
     log.info(f"[INFO] Odoo endpoint: {cfg.odoo_url}")
 
-    api = SportAPIClient(cfg)
+    api = FreeFootballAPIClient(cfg)
     odoo = OdooClient(cfg)
     team_id_map = build_team_id_map()
 
@@ -565,40 +381,29 @@ def main() -> int:
     endpoint_success_count = 0
     for team_name in cfg.teams:
         log.info(f"[INFO] Resolvendo team_id para '{team_name}'...")
-        team_id: Optional[int] = None
-        if cfg.team_search_path:
-            team_id = api.search_team_id(team_name, cfg.country)
-        if not team_id:
-            fallback = team_id_map.get(normalize_team_key(team_name))
-            if fallback:
-                team_id = fallback
-                log.info(f"[INFO] Fallback TEAM_IDS '{team_name}' -> {team_id}")
+        team_id: Optional[int] = team_id_map.get(normalize_team_key(team_name))
+        if team_id:
+            log.info(f"[INFO] TEAM_IDS '{team_name}' -> {team_id}")
         if not team_id:
             log.error(f"[ERROR] Não foi possível resolver team_id para '{team_name}'. Pulando.")
             continue
 
         log.info(f"[INFO] Time '{team_name}' -> team_id {team_id}")
         try:
-            events, endpoint_ok = api.events_by_team(team_id)
+            fixtures = api.fixtures_by_team(team_id, cfg.season, dfrom, dto)
         except SystemExit:
             raise
         except Exception as exc:
             log.error(f"[ERROR] Falha ao buscar jogos de {team_name}: {exc}")
             continue
-        finally:
-            time.sleep(0.5)
-
-        if not endpoint_ok:
-            log.error(f"[ERROR] Nenhum endpoint válido encontrado para '{team_name}'. Verifique o provider.")
-            continue
 
         endpoint_success_count += 1
 
-        log.info(f"[INFO] Quantidade de jogos retornados (bruto) para {team_name}: {len(events)}")
+        log.info(f"[INFO] Quantidade de jogos retornados (bruto) para {team_name}: {len(fixtures)}")
 
         team_matches: List[Dict[str, Any]] = []
-        for event in events:
-            normalized = normalize_event(event)
+        for fx in fixtures:
+            normalized = normalize_fixture(fx)
             if not normalized:
                 continue
             event_dt = parse_normalized_datetime(normalized["match_datetime"])
@@ -617,6 +422,7 @@ def main() -> int:
 
         log.info(f"[INFO] Quantidade de jogos encontrados para {team_name}: {len(team_matches)}")
         all_matches.extend(team_matches)
+        time.sleep(0.5)
 
     dedup: Dict[str, Dict[str, Any]] = {}
     for match in all_matches:
