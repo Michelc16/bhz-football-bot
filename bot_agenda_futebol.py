@@ -5,7 +5,7 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 
@@ -61,6 +61,15 @@ class Config:
     retry_max: int = 3
     max_event_pages: int = DEFAULT_MAX_EVENT_PAGES
     team_search_path: Optional[str] = None
+
+
+@dataclass
+class EndpointSelection:
+    mode: str  # slash, query, single
+    template: str
+    params: Optional[Dict[str, Any]] = None
+    first_page: Optional[int] = None
+    first_payload: Optional[Dict[str, Any]] = None
 
 
 def normalize_team_key(name: str) -> str:
@@ -152,6 +161,93 @@ class SportAPIClient:
 
         raise RuntimeError(f"SportAPI falhou após {self.cfg.retry_max} tentativas em {path}")
 
+    @staticmethod
+    def _extract_events_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        for key in ("events", "data", "results"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return items
+        return []
+
+    def fetch_team_events_next(self, team_id: int) -> Optional[EndpointSelection]:
+        attempts = [
+            {
+                "mode": "slash",
+                "template": "/api/v1/team/{team_id}/events/next/{page}",
+                "page": 0,
+                "label": "/api/v1/team/{team_id}/events/next/0",
+            },
+            {
+                "mode": "slash",
+                "template": "/api/v1/team/{team_id}/events/next/{page}",
+                "page": 1,
+                "label": "/api/v1/team/{team_id}/events/next/1",
+            },
+            {
+                "mode": "query",
+                "template": "/api/v1/team/{team_id}/events/next",
+                "page": 0,
+                "label": "/api/v1/team/{team_id}/events/next?page=0",
+            },
+            {
+                "mode": "query",
+                "template": "/api/v1/team/{team_id}/events/next",
+                "page": 1,
+                "label": "/api/v1/team/{team_id}/events/next?page=1",
+            },
+            {
+                "mode": "single",
+                "template": "/api/v1/team/{team_id}/events/next",
+                "label": "/api/v1/team/{team_id}/events/next",
+            },
+        ]
+
+        for attempt in attempts:
+            mode = attempt["mode"]
+            template = attempt["template"]
+            try:
+                if mode == "slash":
+                    page = attempt["page"]
+                    path = template.format(team_id=team_id, page=page)
+                    payload = self._get(path)
+                    log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}")
+                    return EndpointSelection(
+                        mode="slash",
+                        template=template,
+                        first_page=page,
+                        first_payload=payload,
+                    )
+                if mode == "query":
+                    page = attempt["page"]
+                    path = template.format(team_id=team_id)
+                    base_params = dict(attempt.get("params", {}))
+                    params = dict(base_params)
+                    params["page"] = page
+                    payload = self._get(path, params=params)
+                    log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}?page={page}")
+                    return EndpointSelection(
+                        mode="query",
+                        template=template,
+                        params=base_params,
+                        first_page=page,
+                        first_payload=payload,
+                    )
+                path = template.format(team_id=team_id)
+                payload = self._get(path)
+                log.info(f"[INFO] Endpoint válido para team_id {team_id}: {path}")
+                return EndpointSelection(
+                    mode="single",
+                    template=template,
+                    first_payload=payload,
+                )
+            except FileNotFoundError:
+                continue
+
+        log.error(f"[ERROR] Nenhum endpoint válido encontrado (todos retornaram 404) para team_id {team_id}.")
+        return None
+
     def search_team_id(self, team_name: str, country: str) -> Optional[int]:
         if not self.cfg.team_search_path:
             return None
@@ -195,16 +291,58 @@ class SportAPIClient:
                 continue
         return None
 
-    def events_by_team(self, team_id: int) -> List[Dict[str, Any]]:
+    def events_by_team(self, team_id: int) -> Tuple[List[Dict[str, Any]], bool]:
+        selection = self.fetch_team_events_next(team_id)
+        if not selection:
+            return [], False
+
         events: List[Dict[str, Any]] = []
-        for page in range(self.cfg.max_event_pages):
-            path = f"/api/v1/team/{team_id}/events/next/{page}"
-            data = self._get(path)
-            chunk = data.get("events") or data.get("data") or []
-            if not isinstance(chunk, list) or not chunk:
-                break
+
+        if selection.mode == "slash":
+            for page in range(self.cfg.max_event_pages):
+                payload: Optional[Dict[str, Any]] = None
+                if selection.first_page == page and selection.first_payload is not None:
+                    payload = selection.first_payload
+                else:
+                    path = selection.template.format(team_id=team_id, page=page)
+                    try:
+                        payload = self._get(path)
+                    except FileNotFoundError:
+                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Continuando discovery.")
+                        continue
+                chunk = self._extract_events_from_payload(payload or {})
+                if not chunk:
+                    continue
+                events.extend(chunk)
+
+        elif selection.mode == "query":
+            base_params = dict(selection.params or {})
+            for page in range(self.cfg.max_event_pages):
+                payload = None
+                if selection.first_page == page and selection.first_payload is not None:
+                    payload = selection.first_payload
+                else:
+                    params = dict(base_params)
+                    params["page"] = page
+                    path = selection.template.format(team_id=team_id)
+                    try:
+                        payload = self._get(path, params=params)
+                    except FileNotFoundError:
+                        log.info(f"[INFO] Página {page} retornou 404 para team_id {team_id}. Continuando discovery.")
+                        continue
+                chunk = self._extract_events_from_payload(payload or {})
+                if not chunk:
+                    continue
+                events.extend(chunk)
+
+        else:  # single
+            payload = selection.first_payload
+            if payload is None:
+                payload = self._get(selection.template.format(team_id=team_id))
+            chunk = self._extract_events_from_payload(payload or {})
             events.extend(chunk)
-        return events
+
+        return events, True
 
 
 class OdooClient:
@@ -380,6 +518,7 @@ def main() -> int:
     team_id_map = build_team_id_map()
 
     all_matches: List[Dict[str, Any]] = []
+    endpoint_success_count = 0
     for team_name in cfg.teams:
         log.info(f"[INFO] Resolvendo team_id para '{team_name}'...")
         team_id: Optional[int] = None
@@ -396,12 +535,20 @@ def main() -> int:
 
         log.info(f"[INFO] Time '{team_name}' -> team_id {team_id}")
         try:
-            events = api.events_by_team(team_id)
+            events, endpoint_ok = api.events_by_team(team_id)
         except SystemExit:
             raise
         except Exception as exc:
             log.error(f"[ERROR] Falha ao buscar jogos de {team_name}: {exc}")
             continue
+        finally:
+            time.sleep(0.5)
+
+        if not endpoint_ok:
+            log.error(f"[ERROR] Nenhum endpoint válido encontrado para '{team_name}'. Verifique o provider.")
+            continue
+
+        endpoint_success_count += 1
 
         log.info(f"[INFO] Quantidade de jogos retornados (bruto) para {team_name}: {len(events)}")
 
@@ -417,13 +564,16 @@ def main() -> int:
 
         log.info(f"[INFO] Quantidade de jogos encontrados para {team_name}: {len(team_matches)}")
         all_matches.extend(team_matches)
-        time.sleep(0.5)
 
     dedup: Dict[str, Dict[str, Any]] = {}
     for match in all_matches:
         dedup[match["external_id"]] = match
     matches = list(dedup.values())
     log.info(f"[INFO] Total normalizado (dedup): {len(matches)}")
+
+    if endpoint_success_count == 0:
+        log.error("[ERROR] Nenhum endpoint válido encontrado para todos os times. Abortando.")
+        return 1
 
     if not matches:
         log.info("[INFO] Nada para enviar.")
