@@ -1,14 +1,14 @@
 # BHZ Football Bot (GitHub Actions)
 
-Bot externo para buscar a agenda de jogos do Cruzeiro, Atlético-MG e América-MG diretamente em fontes abertas (GE/Globo Esporte e outros sites públicos) e enviar para o módulo **Agenda de Futebol** do seu Odoo via endpoint REST:
+Bot externo para buscar a agenda de jogos do Cruzeiro, Atlético-MG e América-MG rastreando as páginas de *fixtures* no FlashScore e enviar para o módulo **Agenda de Futebol** do seu Odoo via endpoint REST:
 
 `POST /bhz/football/api/matches`
 
 ## ✅ O que ele faz
 
-1. Faz scraping da página oficial do [Campeonato Mineiro no GE](https://ge.globo.com/mg/futebol/campeonato-mineiro/) e coleta novos jogos/rodadas.
+1. Faz scraping das páginas de fixtures do FlashScore e coleta os próximos jogos oficiais dos três clubes mineiros.
 2. Normaliza nomes, competições e datas para o formato aceito pelo Odoo (`YYYY-MM-DD HH:MM:SS` em America/Sao_Paulo).
-3. Deduplica partidas (hash determinístico `ge_mineiro+dt+mandante+visitante+estádio`).
+3. Deduplica partidas (hash determinístico `flashscore|<data>|<mandante>|<visitante>`).
 4. Envia as partidas em lote para o Odoo (ou roda em modo DRY-RUN apenas para inspeção).
 
 ---
@@ -23,7 +23,7 @@ Bot externo para buscar a agenda de jogos do Cruzeiro, Atlético-MG e América-M
 
 ## Variáveis de ambiente
 
-O script **não usa `.env`**. Configure as variáveis no GitHub Actions ou localmente.
+O script carrega automaticamente um arquivo `.env` presente no diretório raiz do projeto. Ainda assim, você pode configurar as mesmas variáveis diretamente no ambiente (GitHub Actions, terminal, etc.); o resultado é equivalente.
 
 Obrigatórias:
 
@@ -44,15 +44,8 @@ Opcionais:
 - `HTTP_TIMEOUT`  
   Timeout em segundos para requests HTTP (default: `45`).
 
-- `FREEAPI_TEAM_IDS`  
-  JSON com fallback manual de `{"Time": 123}` usado apenas se algum provider não conseguir identificar o time.
-
 - `DRY_RUN`  
-  Defina `DRY_RUN=1` para executar os scrapers e exibir o resumo **sem** enviar ao Odoo.
-
-- `GE_CACHE` / `GE_OFFLINE`  
-  `GE_CACHE=1` salva o HTML do GE em `.cache/ge_mineiro.html`.  
-  `GE_OFFLINE=1` reutiliza o HTML em cache (útil para debug sem internet).
+  Defina `DRY_RUN=1` para executar o scraper e exibir o resumo **sem** enviar ao Odoo.
 
 ---
 
@@ -75,17 +68,7 @@ O modo `DRY_RUN` imprime o total por provider/time e encerra sem POST no Odoo.
 
 ## Provider atual
 
-- `providers/ge_globo_mineiro_provider.py`: faz scraping do site do GE e extrai todas as partidas do Campeonato Mineiro (rodada por rodada).  
-  Se a estrutura do site mudar, ajuste apenas este provider. Execute `python providers/ge_globo_mineiro_provider.py` para um debug rápido (imprime os primeiros jogos).
+- `providers/flashscore_provider.py`: usa os *fixtures* estáticos do FlashScore (+ IDs fixos) e tenta manter os três times dentro da janela configurada.  
+  O parsing identifica mandante/visitante, data/hora/estádio e envia um payload compatível com o Odoo. Configure os links em `providers/flashscore_provider.py::TEAM_PAGES` se um time mudar de URL.
 
 ---
-
-## Scraper / Rate limit
-
-O `ScraperClient` em `scraper.py` centraliza:
-
-- `requests.Session` com `User-Agent` realista
-- Retry/backoff automático em 429/5xx
-- Rate limit simples (intervalo mínimo entre requisições)
-
-Respeite robots/ToS dos sites ao adicionar novos providers.
