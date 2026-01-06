@@ -8,7 +8,7 @@ import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 import requests
@@ -323,7 +323,7 @@ def _collect_events_from_json(payload) -> List[Dict[str, str]]:
 def _parse_date_time_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     if not text:
         return None, None
-    tokens = [t.strip() for t in re.split(r"[•\-\|\n]", text) if t.strip()]
+    tokens = [t.strip() for t in re.split(r"[•\-|\n]", text) if t.strip()]
     date_token = None
     time_token = None
     for token in tokens:
