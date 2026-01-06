@@ -115,20 +115,53 @@ class OdooClient:
 
     def post_matches(self, matches: List[Dict[str, str]], retry_on_datetime_error: bool = True) -> Dict[str, str]:
         url = self.cfg.odoo_url.rstrip("/") + "/bhz/football/api/matches"
-        payload = json.dumps({"matches": matches})
+        prepared = [self._prepare_payload(match) for match in matches]
+        payload_dict = {"matches": prepared}
+        payload = json.dumps(payload_dict)
         response = self.session.post(url, data=payload, timeout=self.cfg.timeout)
         body = response.text
         if response.status_code >= 400:
+            log.error(
+                "[ERROR] Odoo retornou status %s. Body: %s\nPayload:\n%s",
+                response.status_code,
+                body[:1000],
+                json.dumps(payload_dict, indent=2, ensure_ascii=False),
+            )
             if retry_on_datetime_error and "time data" in body.lower():
                 log.warning("[WARN] Odoo reclamou de data/hora. Ajustando formato e reenviando...")
-                for match in matches:
-                    match["match_datetime"] = normalize_datetime_str(match["match_datetime"])
-                return self.post_matches(matches, retry_on_datetime_error=False)
-            raise RuntimeError(f"Odoo {response.status_code} em {url}: {body[:500]}")
+                for match in prepared:
+                    if "date" in match:
+                        match["date"] = normalize_datetime_str(match["date"])
+                return self.post_matches(prepared, retry_on_datetime_error=False)
+            return {"ok": False, "status_code": response.status_code, "raw": body[:500]}
         try:
             return response.json()
         except Exception:
             return {"ok": True, "raw": body[:500]}
+
+    def _prepare_payload(self, match: Dict[str, str]) -> Dict[str, str]:
+        home = (match.get("home_team") or match.get("home") or "").strip() or "Time"
+        away = (match.get("away_team") or match.get("away") or "").strip() or "Adversário"
+        date_value = match.get("match_datetime") or match.get("date")
+        try:
+            normalized_date = normalize_datetime_str(date_value)
+        except Exception:
+            normalized_date = datetime.utcnow().strftime(NORMALIZED_DATETIME_FORMAT)
+        competition = (match.get("competition") or "Campeonato Mineiro").strip() or "Campeonato Mineiro"
+        source = (match.get("source") or "FlashScore").strip() or "FlashScore"
+        venue = (match.get("venue") or match.get("stadium") or "A definir").strip() or "A definir"
+        external_base = f"{source}:{home}:{away}:{normalized_date}"
+        external_id = external_base
+        return {
+            "external_id": external_id,
+            "competition": competition,
+            "date": normalized_date,
+            "match_datetime": normalized_date,
+            "home_team": home,
+            "away_team": away,
+            "source": source,
+            "venue": venue,
+        }
 
 
 def load_config() -> Config:
